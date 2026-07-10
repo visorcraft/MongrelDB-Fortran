@@ -1,0 +1,40 @@
+name = "mongreldb"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+author = "VisorCraft LLC"
+maintainer = "VisorCraft LLC"
+copyright = "Copyright (c) 2024-2026 VisorCraft LLC"
+description = "Modern Fortran 2018 HTTP client for mongreldb-server"
+
+[build]
+auto-executables = false
+auto-tests = false
+auto-examples = false
+
+[library]
+source-dir = "src"
+
+[[test]]
+name = "wire_shape"
+source-dir = "tests"
+main = "wire_shape_test.f90"
+
+[[test]]
+name = "live_conformance"
+source-dir = "tests"
+main = "live_test.f90"
+
+[[example]]
+name = "basic_crud"
+source-dir = "examples"
+main = "basic_crud.f90"
+
+[[example]]
+name = "query_builder"
+source-dir = "examples"
+main = "query_builder.f90"
+
+[[example]]
+name = "transactions"
+source-dir = "examples"
+main = "transactions.f90"

@@ -217,36 +217,47 @@ contains
     if (is_iostat_end(stat)) stat = 0
   end subroutine
 
-  !> Read a file into a deferred-length allocatable string, joining lines with
-  !> newlines so multi-line JSON bodies round-trip correctly.
+  !> Read a file into a deferred-length allocatable string using stream
+  !> (binary) access. This reads the exact bytes without line-buffer
+  !> truncation or trim() side-effects, which is essential for JSON bodies
+  !> that may be long single lines or contain values with trailing spaces.
   subroutine read_text_file_alloc(path, buf, stat)
     character(*), intent(in) :: path
     character(:), allocatable, intent(out) :: buf
     integer, intent(out) :: stat
-    integer :: u
+    integer :: u, filesize, i
     logical :: exists
-    character(65536) :: line
-    logical :: first
+    character(1), allocatable :: chars(:)
 
     stat = 0
     buf = ''
     inquire(file=path, exist=exists)
     if (.not. exists) return
-    open(newunit=u, file=path, status='old', action='read', iostat=stat)
+    ! Open in stream mode to get byte-accurate reading.
+    open(newunit=u, file=path, status='old', action='read', &
+         form='unformatted', access='stream', iostat=stat)
     if (stat /= 0) return
-    first = .true.
-    do
-      read(u, '(A)', iostat=stat) line
-      if (stat /= 0) exit
-      if (first) then
-        buf = trim(line)
-        first = .false.
-      else
-        buf = buf // char(10) // trim(line)
-      end if
-    end do
-    if (is_iostat_end(stat)) stat = 0
+    ! Determine file size by seeking to end.
+    filesize = 0
+    inquire(unit=u, size=filesize, iostat=stat)
+    if (stat /= 0 .or. filesize <= 0) then
+      close(u)
+      stat = 0
+      return
+    end if
+    allocate(chars(filesize))
+    rewind(u)
+    read(u, iostat=stat) chars
     close(u)
+    if (stat /= 0) then
+      stat = 0
+      return
+    end if
+    ! Build the string from the byte array.
+    buf = ''
+    do i = 1, filesize
+      buf = buf // chars(i)
+    end do
   end subroutine
 
   subroutine safe_unlink(path)

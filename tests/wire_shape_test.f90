@@ -60,7 +60,7 @@ contains
   ! ---- Tests --------------------------------------------------------------
 
   subroutine test_json_object()
-    type(json_value) :: obj, v
+    type(json_value) :: obj, v, got
     character(:), allocatable :: s
     integer :: stat
     character(256) :: errmsg
@@ -72,12 +72,14 @@ contains
     call check(stat == 0, 'object round-trip parse failed')
     call check(json_object_has(v, 'name'), 'object missing key name')
     call check(json_object_has(v, 'id'), 'object missing key id')
-    call check(json_object_get(v, 'name')%str_val == 'orders', 'name value mismatch')
-    call check(json_object_get(v, 'id')%int_val == 42_int64, 'id value mismatch')
+    got = json_object_get(v, 'name')
+    call check(got%str_val == 'orders', 'name value mismatch')
+    got = json_object_get(v, 'id')
+    call check(got%int_val == 42_int64, 'id value mismatch')
   end subroutine
 
   subroutine test_json_array()
-    type(json_value) :: arr, v
+    type(json_value) :: arr, v, elem
     character(:), allocatable :: s
     integer :: stat
     character(256) :: errmsg
@@ -90,7 +92,8 @@ contains
     call json_parse(s, v, stat, errmsg)
     call check(stat == 0, 'array round-trip parse failed')
     call check(json_array_len(v) == 5, 'array length mismatch')
-    call check(json_array_get(v, 3)%int_val == 3_int64, 'array element 3 mismatch')
+    elem = json_array_get(v, 3)
+    call check(elem%int_val == 3_int64, 'array element 3 mismatch')
   end subroutine
 
   subroutine test_json_escape()
@@ -135,8 +138,11 @@ contains
     call json_parse(s, v, stat, errmsg)
     call check(stat == 0, 'nested parse failed')
     got = json_object_get(v, 'outer')
-    call check(json_object_get(got, 'nested_key')%str_val == 'nested_value', &
-               'nested value mismatch')
+    block
+      type(json_value) :: inner_val
+      inner_val = json_object_get(got, 'nested_key')
+      call check(inner_val%str_val == 'nested_value', 'nested value mismatch')
+    end block
   end subroutine
 
   subroutine test_url_encode()

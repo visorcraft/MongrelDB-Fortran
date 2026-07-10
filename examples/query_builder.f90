@@ -44,12 +44,13 @@ program query_builder
   call db%put(table, '[1,4,2,"Dave",3,350.0]', stat, errmsg)
   if (stat /= MDB_OK) call die('seed put failed: ' // trim(errmsg))
 
-  ! Build a range query: amount >= 100, projecting columns id (1) and customer (2).
-  ! On the wire this is a /kit/query body:
-  !   { "table": ..., "conditions": [{"range":{"column_id":3,"lo":100.0}}],
+  ! Build a query with a bitmap equality condition (matches column 2 = "Bob"),
+  ! projecting columns id (1) and customer (2). On the wire this is a
+  ! /kit/query body:
+  !   { "table": ..., "conditions": [{"bitmap_eq":{"column_id":2,"value":"Bob"}}],
   !     "projection": [1,2], "limit": 100 }
   query_body = '{"table":"' // table // '",' // &
-               '"conditions":[{"range":{"column_id":3,"lo":100.0}}],' // &
+               '"conditions":[{"bitmap_eq":{"column_id":2,"value":"Bob"}}],' // &
                '"projection":[1,2],"limit":100}'
 
   call db%query(query_body, result_json, stat, errmsg)
@@ -62,7 +63,7 @@ program query_builder
   if (json_object_has(doc, 'rows')) then
     rows = json_object_get(doc, 'rows')
     nrows = json_array_len(rows)
-    write(*, '(A,I0)') 'rows in range (amount >= 100): ', nrows
+    write(*, '(A,I0)') 'rows matching customer=Bob: ', nrows
     do i = 1, nrows
       row = json_array_get(rows, i)
       write(*, '(A,A)') '  ', json_serialize(row)

@@ -177,18 +177,19 @@ contains
   ! ---- create_table -------------------------------------------------------
 
   !> POST /kit/create_table. `columns_json` is the serialized columns array.
-  !> Returns the new table id, or 0 if none was reported.
-  function client_create_table(this, name, columns_json, stat, errmsg) result(tid)
+  !> Sets `table_id` to the new table id, or 0 if none was reported.
+  subroutine client_create_table(this, name, columns_json, stat, errmsg, table_id)
     class(mongreldb_client), intent(inout) :: this
     character(*), intent(in) :: name
     character(*), intent(in) :: columns_json
     integer, intent(out) :: stat
     character(*), intent(out), optional :: errmsg
-    integer(int64) :: tid
+    integer(int64), intent(out), optional :: table_id
     type(http_response) :: resp
     type(json_value) :: body, cols, doc
     character(:), allocatable :: payload
     integer :: jstat
+    integer(int64) :: tid
     character(256) :: msg
 
     tid = 0
@@ -197,6 +198,7 @@ contains
     call json_parse(columns_json, cols, jstat, msg)
     if (jstat /= 0) then
       call this%set_err(MDB_ERR_INVALID_ARG, 'invalid columns JSON: ' // msg, errmsg)
+      if (present(table_id)) table_id = 0
       return
     end if
     body = json_make_object()
@@ -207,6 +209,7 @@ contains
     resp = this%do_request('POST', 'kit/create_table', payload, stat, msg)
     if (stat /= MDB_OK) then
       call this%set_err(stat, msg, errmsg)
+      if (present(table_id)) table_id = 0
       return
     end if
     call json_parse(resp%body, doc, jstat, msg)
@@ -219,7 +222,8 @@ contains
         end block
       end if
     end if
-  end function
+    if (present(table_id)) table_id = tid
+  end subroutine
 
   subroutine client_drop_table(this, name, stat, errmsg)
     class(mongreldb_client), intent(inout) :: this
@@ -336,7 +340,7 @@ contains
     character(*), intent(out), optional :: errmsg
     character(*), intent(in), optional :: idem_key
     type(http_response) :: resp
-    type(json_value) :: body, doc
+    type(json_value) :: body
     character(:), allocatable :: payload
     integer :: jstat
     character(256) :: msg
@@ -481,6 +485,7 @@ contains
 
     stat = MDB_OK
     errmsg = ''
+    code_msg = ''
     url = this%url // '/' // path
 
     resp = http_request(url, method, payload, this%auth_header, this%max_bytes)
@@ -535,7 +540,7 @@ contains
     character(*), intent(in) :: ops_json
     integer, intent(out) :: stat
     character(*), intent(out), optional :: errmsg
-    character(:), allocatable :: results_json, payload
+    character(:), allocatable :: payload
     type(json_value) :: body
     integer :: jstat
     character(256) :: msg
@@ -572,6 +577,12 @@ contains
     integer, intent(in) :: stat
     character(*), intent(in) :: msg
     character(*), intent(out), optional :: errmsg
+    ! Associate the passed-object and status arguments so the compiler does
+    ! not flag them unused; the error code is already in `stat` on the caller
+    ! side and this routine exists only to surface the message.
+    if (.false.) then
+      if (len(this%url) >= 0 .and. stat == stat) return
+    end if
     if (present(errmsg)) errmsg = msg
   end subroutine
 

@@ -22,6 +22,7 @@ module mongreldb_json
   public :: json_make_object, json_object_set, json_object_set_int, &
             json_object_set_str, json_object_set_bool
   public :: json_make_array, json_array_push
+  public :: json_deep_copy
 
   !> Discriminator constants for `json_value%kind`.
   integer, parameter :: JSON_NULL   = 0
@@ -34,6 +35,14 @@ module mongreldb_json
 
   !> A JSON value. The `kind` field selects which `*_val` member is meaningful.
   !> For arrays, `children` holds the elements. For objects, `keys` and
+  !> A box around a single deferred-length string, so we can build an array
+  !> of variable-length keys. Allocatable derived-type arrays can be grown
+  !> without a character length type-spec (which F2018 forbids for deferred
+  !> parameters). Each box holds one key; assignment sizes the string.
+  type :: str_box
+    character(:), allocatable :: s
+  end type str_box
+
   !> `children` are parallel arrays (key i -> children(i)).
   type :: json_value
     integer :: kind = JSON_NULL
@@ -42,7 +51,7 @@ module mongreldb_json
     real(real64) :: real_val = 0.0_real64
     character(:), allocatable :: str_val
     type(json_value), allocatable :: children(:)
-    character(:), allocatable :: keys(:)
+    type(str_box), allocatable :: keys(:)
   end type json_value
 
 contains
@@ -85,7 +94,7 @@ contains
   function json_make_object() result(v)
     type(json_value) :: v
     v%kind = JSON_OBJECT
-    allocate(v%keys(0), source=[character(0)::])
+    allocate(v%keys(0))
     allocate(v%children(0))
   end function
 
@@ -93,6 +102,32 @@ contains
     type(json_value) :: v
     v%kind = JSON_ARRAY
     allocate(v%children(0))
+  end function
+
+  !> Recursive deep copy of a json_value. Bypasses intrinsic assignment of the
+  !> self-referential type, which can corrupt nested children on some compilers
+  !> when the source is later deallocated or reused.
+  recursive function json_deep_copy(src) result(dst)
+    type(json_value), intent(in) :: src
+    type(json_value) :: dst
+    integer :: i
+    dst%kind = src%kind
+    dst%bool_val = src%bool_val
+    dst%int_val = src%int_val
+    dst%real_val = src%real_val
+    if (allocated(src%str_val)) dst%str_val = src%str_val
+    if (allocated(src%children)) then
+      allocate(dst%children(size(src%children)))
+      do i = 1, size(src%children)
+        dst%children(i) = json_deep_copy(src%children(i))
+      end do
+    end if
+    if (allocated(src%keys)) then
+      allocate(dst%keys(size(src%keys)))
+      do i = 1, size(src%keys)
+        if (allocated(src%keys(i)%s)) dst%keys(i)%s = src%keys(i)%s
+      end do
+    end if
   end function
 
   ! ---- Object builders ----------------------------------------------------
@@ -103,19 +138,20 @@ contains
     character(*), intent(in) :: key
     type(json_value), intent(in) :: val
     type(json_value), allocatable :: tmp_c(:)
-    character(:), allocatable :: tmp_k(:)
-    integer :: n
+    type(str_box), allocatable :: tmp_k(:)
+    integer :: n, i
     n = size(obj%keys)
     allocate(tmp_c(n+1))
-    ! Allocate the parallel keys array using source= so each element is a
-    ! deferred-length allocatable string (assignment below sizes each one).
-    allocate(tmp_k(n+1), source=[character(0)::])
-    if (n > 0) then
-      tmp_c(1:n) = obj%children
-      tmp_k(1:n) = obj%keys
-    end if
-    tmp_c(n+1) = val
-    tmp_k(n+1) = key
+    allocate(tmp_k(n+1))
+    ! Element-by-element deep copy: intrinsic array assignment corrupts
+    ! nested json_value children on some compilers, so we deep-copy each
+    ! entry explicitly via json_deep_copy.
+    do i = 1, n
+      tmp_c(i) = json_deep_copy(obj%children(i))
+      tmp_k(i) = obj%keys(i)
+    end do
+    tmp_c(n+1) = json_deep_copy(val)
+    tmp_k(n+1)%s = key
     call move_alloc(tmp_c, obj%children)
     call move_alloc(tmp_k, obj%keys)
   end subroutine
@@ -147,11 +183,15 @@ contains
     type(json_value), intent(inout) :: arr
     type(json_value), intent(in) :: val
     type(json_value), allocatable :: tmp(:)
-    integer :: n
+    integer :: n, i
     n = size(arr%children)
     allocate(tmp(n+1))
-    if (n > 0) tmp(1:n) = arr%children
-    tmp(n+1) = val
+    ! Deep-copy existing children to avoid intrinsic-assignment corruption
+    ! of nested json_value structures.
+    do i = 1, n
+      tmp(i) = json_deep_copy(arr%children(i))
+    end do
+    tmp(n+1) = json_deep_copy(val)
     call move_alloc(tmp, arr%children)
   end subroutine
 
@@ -166,7 +206,7 @@ contains
     found = .false.
     if (obj%kind /= JSON_OBJECT) return
     do i = 1, size(obj%keys)
-      if (obj%keys(i) == key) then
+      if (obj%keys(i)%s == key) then
         found = .true.
         exit
       end if
@@ -182,8 +222,8 @@ contains
     out = json_make_null()
     if (obj%kind /= JSON_OBJECT) return
     do i = 1, size(obj%keys)
-      if (obj%keys(i) == key) then
-        out = obj%children(i)
+      if (obj%keys(i)%s == key) then
+        out = json_deep_copy(obj%children(i))
         return
       end if
     end do
@@ -196,7 +236,7 @@ contains
     type(json_value) :: out
     out = json_make_null()
     if (arr%kind == JSON_ARRAY) then
-      if (i >= 1 .and. i <= size(arr%children)) out = arr%children(i)
+      if (i >= 1 .and. i <= size(arr%children)) out = json_deep_copy(arr%children(i))
     end if
   end function
 
@@ -260,7 +300,7 @@ contains
       end if
     end subroutine
 
-    subroutine parse_value(v)
+    recursive subroutine parse_value(v)
       type(json_value), intent(out) :: v
       character :: c
       if (pos > len(text)) then
@@ -287,7 +327,7 @@ contains
       end select
     end subroutine
 
-    subroutine parse_object(v)
+    recursive subroutine parse_object(v)
       type(json_value), intent(out) :: v
       character(:), allocatable :: key
       type(json_value) :: elem
@@ -337,7 +377,7 @@ contains
       end do
     end subroutine
 
-    subroutine parse_array(v)
+    recursive subroutine parse_array(v)
       type(json_value), intent(out) :: v
       type(json_value) :: elem
       v = json_make_array()
@@ -373,7 +413,7 @@ contains
       end do
     end subroutine
 
-    subroutine parse_string_val(v)
+    recursive subroutine parse_string_val(v)
       type(json_value), intent(out) :: v
       character(:), allocatable :: s
       call parse_string_raw(s)
@@ -383,7 +423,7 @@ contains
 
     !> Parse a quoted string into `out` (a deferred-length allocatable).
     !> Builds the string by concatenation; uses a local helper.
-    subroutine parse_string_raw(out)
+    recursive subroutine parse_string_raw(out)
       character(:), allocatable, intent(out) :: out
       character :: c
       integer :: hexval, j
@@ -449,7 +489,7 @@ contains
       end do
     end subroutine
 
-    subroutine parse_bool_val(v)
+    recursive subroutine parse_bool_val(v)
       type(json_value), intent(out) :: v
       if (pos + 3 <= len(text)) then
         if (text(pos:pos+3) == 'true') then
@@ -468,7 +508,7 @@ contains
       call fail('invalid literal')
     end subroutine
 
-    subroutine parse_null_val(v)
+    recursive subroutine parse_null_val(v)
       type(json_value), intent(out) :: v
       if (pos + 3 <= len(text)) then
         if (text(pos:pos+3) == 'null') then
@@ -480,7 +520,7 @@ contains
       call fail('invalid literal')
     end subroutine
 
-    subroutine parse_number_val(v)
+    recursive subroutine parse_number_val(v)
       type(json_value), intent(out) :: v
       integer :: start, ios
       logical :: is_real
@@ -530,7 +570,7 @@ contains
   end subroutine
 
   !> Append a Unicode codepoint to a deferred-length string as UTF-8 bytes.
-  subroutine append_codepoint(s, cp)
+  recursive subroutine append_codepoint(s, cp)
     character(:), allocatable, intent(inout) :: s
     integer, intent(in) :: cp
     if (cp < 128) then
@@ -589,7 +629,7 @@ contains
       s = '{'
       do i = 1, size(v%keys)
         if (i > 1) s = s // ','
-        s = s // '"' // escape_string(v%keys(i)) // '":'
+        s = s // '"' // escape_string(v%keys(i)%s) // '":'
         s = s // serialize_val(v%children(i))
       end do
       s = s // '}'

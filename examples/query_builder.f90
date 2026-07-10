@@ -1,7 +1,8 @@
 !> Query builder example for the MongrelDB Fortran client.
 !>
-!> Demonstrates building a native index condition (range) and a projection,
-!> running a query, and reading the result rows. Cleans up on exit.
+!> Demonstrates building a native index condition (range_f64 on a float64
+!> column) and a projection, running a query, and reading the result rows.
+!> Cleans up on exit.
 program query_builder
   use, non_intrinsic :: mongreldb
   use, non_intrinsic :: mongreldb_json
@@ -44,14 +45,18 @@ program query_builder
   call db%put(table, '[1,4,2,"Dave",3,350.0]', stat, errmsg)
   if (stat /= MDB_OK) call die('seed put failed: ' // trim(errmsg))
 
-  ! Build a query with a bitmap equality condition (matches column 2 = "Bob"),
-  ! projecting columns id (1) and customer (2). On the wire this is a
-  ! /kit/query body:
-  !   { "table": ..., "conditions": [{"bitmap_eq":{"column_id":2,"value":"Bob"}}],
-  !     "projection": [1,2], "limit": 100 }
+  ! Build a query with a float64 range condition on the amount column (3):
+  !   100.0 <= amount <= 300.0, both inclusive. The float64 column requires
+  !   the "range_f64" condition (not "range", which targets integer columns).
+  ! On the wire this is a /kit/query body:
+  !   { "table": ..., "conditions": [{"range_f64":{"column_id":3,
+  !       "lo":100.0,"hi":300.0,"lo_inclusive":true,"hi_inclusive":true}}],
+  !     "projection": [1,3], "limit": 100 }
   query_body = '{"table":"' // table // '",' // &
-               '"conditions":[{"bitmap_eq":{"column_id":2,"value":"Bob"}}],' // &
-               '"projection":[1,2],"limit":100}'
+               '"conditions":[{"range_f64":{"column_id":3,' // &
+               '"lo":100.0,"hi":300.0,' // &
+               '"lo_inclusive":true,"hi_inclusive":true}}],' // &
+               '"projection":[1,3],"limit":100}'
 
   call db%query(query_body, result_json, stat, errmsg)
   if (stat /= MDB_OK) call die('query failed: ' // trim(errmsg))
@@ -63,7 +68,7 @@ program query_builder
   if (json_object_has(doc, 'rows')) then
     rows = json_object_get(doc, 'rows')
     nrows = json_array_len(rows)
-    write(*, '(A,I0)') 'rows matching customer=Bob: ', nrows
+    write(*, '(A,I0)') 'rows with amount in [100,300]: ', nrows
     do i = 1, nrows
       row = json_array_get(rows, i)
       write(*, '(A,A)') '  ', json_serialize(row)

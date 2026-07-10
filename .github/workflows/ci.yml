@@ -31,11 +31,13 @@ jobs:
       - name: Install fpm
         run: |
           # Install the Fortran Package Manager from its GitHub releases.
+          # The linux-x86_64 asset is a standalone prebuilt binary (not a
+          # tarball), so we download it directly and mark it executable.
           FPM_VERSION="0.10.1"
-          curl -fsSL -o /tmp/fpm.tar.gz \
-            "https://github.com/fortran-lang/fpm/releases/download/v${FPM_VERSION}/fpm-${FPM_VERSION}-linux-x86_64-gcc-12.tar.gz"
           mkdir -p /tmp/fpm-bin
-          tar -xzf /tmp/fpm.tar.gz -C /tmp/fpm-bin
+          curl -fsSL -o /tmp/fpm-bin/fpm \
+            "https://github.com/fortran-lang/fpm/releases/download/v${FPM_VERSION}/fpm-${FPM_VERSION}-linux-x86_64"
+          chmod +x /tmp/fpm-bin/fpm
           echo "/tmp/fpm-bin" >> "$GITHUB_PATH"
 
       - name: Build

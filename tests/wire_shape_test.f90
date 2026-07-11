@@ -10,6 +10,8 @@ program wire_shape_test
   implicit none
 
   integer :: passed, failed
+  integer :: test_fails = 0
+  integer :: saved_fails = 0
   passed = 0
   failed = 0
 
@@ -23,6 +25,12 @@ program wire_shape_test
   call run('crlf rejection in token', test_crlf_token)
   call run('crlf rejection in basic auth', test_crlf_basic)
   call run('column json parse-and-embed', test_column_embed)
+  call run('history retention parse valid', test_history_retention_parse_valid)
+  call run('history retention parse missing key', test_history_retention_parse_missing)
+  call run('history retention parse extra key', test_history_retention_parse_extra)
+  call run('history retention parse non-integer', test_history_retention_parse_non_int)
+  call run('set history retention payload', test_set_history_retention_payload)
+  call run('static default matrix', test_static_default_matrix)
 
   write(*, '(A,I0,A,I0,A)') 'wire_shape: ', passed, ' passed, ', failed, ' failed'
   if (failed > 0) error stop 1
@@ -35,19 +43,30 @@ contains
       subroutine proc()
       end subroutine proc
     end interface
-    logical :: ok
-    ok = .true.
     call proc
-    if (ok) then
+    if (local_fail_count() == 0) then
       passed = passed + 1
-      write(*, '(A,A,A)') '  PASS  ', name, ''
+      write(*, '(A,A)') '  PASS  ', name
+    else
+      failed = failed + local_fail_count()
     end if
+    call reset_fail_count
+  end subroutine
+
+  integer function local_fail_count()
+    local_fail_count = test_fails - saved_fails
+  end function
+
+  subroutine reset_fail_count
+    saved_fails = test_fails
   end subroutine
 
   ! A test calls fail() to record a failure (without aborting the run).
+  ! Per-test failures are accumulated in test_fails; run() adds the delta
+  ! to the global failed counter, so we must not increment it here too.
   subroutine fail(msg)
     character(*), intent(in) :: msg
-    failed = failed + 1
+    test_fails = test_fails + 1
     write(*, '(A,A)') '  FAIL  ', msg
   end subroutine
 
@@ -243,8 +262,6 @@ contains
     call check(json_object_has(parsed, 'columns'), 'payload missing columns key')
     call check(index(s, '"default_value":3') > 0, 'payload missing scalar default_value')
     call check(index(s, '"default_expr":"uuid"') > 0, 'payload missing default_expr')
-    call check(index('["text",3,true,null,"now"]', 'null') > 0, &
-      'static JSON scalar matrix malformed')
     call check(index(s, '"constraints":{"checks":[') > 0, 'payload missing constraints.checks')
     call check(index(s, '"name":"positive_id"') > 0, 'payload missing CHECK name')
   end subroutine
@@ -274,5 +291,172 @@ contains
     call json_object_set(obj, key, v)
     stat = 0
   end subroutine
+
+  ! ---- Retention response parsing ------------------------------------------
+
+  subroutine test_history_retention_parse_valid()
+    type(json_value) :: doc
+    integer :: stat
+    integer(int64) :: epochs, earliest
+    character(256) :: errmsg
+    call json_parse('{"history_retention_epochs":100,"earliest_retained_epoch":5}', &
+                    doc, stat, errmsg)
+    call check(stat == 0, 'valid retention JSON parse failed')
+    if (stat /= 0) return
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'valid retention response should validate')
+    call check(epochs == 100_int64, 'epochs value mismatch')
+    call check(earliest == 5_int64, 'earliest value mismatch')
+  end subroutine
+
+  subroutine test_history_retention_parse_missing()
+    type(json_value) :: doc
+    integer :: stat
+    integer(int64) :: epochs, earliest
+    character(256) :: errmsg
+    call json_parse('{"history_retention_epochs":100}', doc, stat, errmsg)
+    call check(stat == 0, 'missing-key JSON parse failed')
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_ERR_JSON, 'missing key should report JSON error')
+  end subroutine
+
+  subroutine test_history_retention_parse_extra()
+    type(json_value) :: doc
+    integer :: stat
+    integer(int64) :: epochs, earliest
+    character(256) :: errmsg
+    call json_parse('{"history_retention_epochs":100,"earliest_retained_epoch":5,"extra":1}', &
+                    doc, stat, errmsg)
+    call check(stat == 0, 'extra-key JSON parse failed')
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_ERR_JSON, 'extra key should report JSON error')
+  end subroutine
+
+  subroutine test_history_retention_parse_non_int()
+    type(json_value) :: doc
+    integer :: stat
+    integer(int64) :: epochs, earliest
+    character(256) :: errmsg
+    call json_parse('{"history_retention_epochs":"100","earliest_retained_epoch":5}', &
+                    doc, stat, errmsg)
+    call check(stat == 0, 'non-integer JSON parse failed')
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_ERR_JSON, 'non-integer value should report JSON error')
+    call json_parse('{"history_retention_epochs":100,"earliest_retained_epoch":true}', &
+                    doc, stat, errmsg)
+    call check(stat == 0, 'boolean JSON parse failed')
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_ERR_JSON, 'boolean value should report JSON error')
+  end subroutine
+
+  subroutine test_set_history_retention_payload()
+    type(json_value) :: obj
+    character(:), allocatable :: s
+    integer(int64), parameter :: value = 250_int64
+    obj = json_make_object()
+    call json_object_set_int(obj, 'history_retention_epochs', value)
+    s = json_serialize(obj)
+    call check(s == '{"history_retention_epochs":250}', &
+               'set retention payload mismatch: ' // s)
+  end subroutine
+
+  ! ---- Static-default matrix -----------------------------------------------
+
+  subroutine test_static_default_matrix()
+    type(json_value) :: cols, body, parsed, col
+    character(:), allocatable :: cols_str, payload
+    integer :: stat, n
+    character(256) :: errmsg
+
+    cols = json_make_array()
+    call json_array_push(cols, make_col(1_int64, 'id', 'int64', .true.))
+
+    col = make_col(2_int64, 'label', 'varchar', .false.)
+    call json_object_set_str(col, 'default_value', 'draft')
+    call json_array_push(cols, col)
+
+    col = make_col(3_int64, 'qty', 'int64', .false.)
+    call json_object_set_int(col, 'default_value', 7_int64)
+    call json_array_push(cols, col)
+
+    col = make_col(4_int64, 'active', 'bool', .false.)
+    call json_object_set_bool(col, 'default_value', .true.)
+    call json_array_push(cols, col)
+
+    col = make_col(5_int64, 'notes', 'varchar', .false.)
+    call json_object_set(col, 'default_value', json_make_null())
+    call json_array_push(cols, col)
+
+    col = make_col(6_int64, 'created', 'varchar', .false.)
+    call json_object_set_str(col, 'default_value', 'now')
+    call json_array_push(cols, col)
+
+    col = make_col(7_int64, 'updated', 'varchar', .false.)
+    call json_object_set_str(col, 'default_expr', 'now')
+    call json_array_push(cols, col)
+
+    cols_str = json_serialize(cols)
+    body = json_make_object()
+    call json_object_set_str(body, 'name', 'defaults_demo')
+    call json_parse_and_set(body, 'columns', cols_str, stat, errmsg)
+    call check(stat == 0, 'default matrix column parse failed')
+    if (stat /= 0) return
+
+    payload = json_serialize(body)
+    call json_parse(payload, parsed, stat, errmsg)
+    call check(stat == 0, 'default matrix payload re-parse failed')
+    if (stat /= 0) return
+
+    if (.not. json_object_has(parsed, 'columns')) then
+      call fail('payload missing columns'); return
+    end if
+    cols = json_object_get(parsed, 'columns')
+    if (cols%kind /= JSON_ARRAY) then
+      call fail('columns is not an array'); return
+    end if
+    n = json_array_len(cols)
+    call check(n == 7, 'default matrix column count mismatch')
+    if (n < 7) return
+
+    call check_col_default(cols, 2, 'default_value', JSON_STRING, '"draft"')
+    call check_col_default(cols, 3, 'default_value', JSON_INT, '7')
+    call check_col_default(cols, 4, 'default_value', JSON_BOOL, 'true')
+    call check_col_default(cols, 5, 'default_value', JSON_NULL, 'null')
+    call check_col_default(cols, 6, 'default_value', JSON_STRING, '"now"')
+    call check_col_default(cols, 7, 'default_expr', JSON_STRING, '"now"')
+
+    col = json_array_get(cols, 6)
+    call check(.not. json_object_has(col, 'default_expr'), &
+               'literal "now" default_value must not become default_expr')
+    col = json_array_get(cols, 7)
+    call check(.not. json_object_has(col, 'default_value'), &
+               'default_expr column must not also carry default_value')
+  end subroutine
+
+  subroutine check_col_default(cols, idx, key, kind, expected)
+    type(json_value), intent(in) :: cols
+    integer, intent(in) :: idx, kind
+    character(*), intent(in) :: key, expected
+    type(json_value) :: col, val
+    character(:), allocatable :: got
+
+    col = json_array_get(cols, idx)
+    if (.not. json_object_has(col, key)) then
+      call fail('column ' // int_str(idx) // ' missing ' // key); return
+    end if
+    val = json_object_get(col, key)
+    if (val%kind /= kind) then
+      call fail('column ' // int_str(idx) // ' ' // key // ' kind mismatch'); return
+    end if
+    got = json_serialize(val)
+    call check(got == expected, 'column ' // int_str(idx) // ' ' // key // &
+                                ' expected ' // expected // ' got ' // got)
+  end subroutine
+
+  function int_str(i) result(s)
+    integer, intent(in) :: i
+    character(16) :: s
+    write(s, '(I0)') i
+  end function
 
 end program

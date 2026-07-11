@@ -25,6 +25,7 @@ module mongreldb
   public :: MDB_OK, MDB_ERR_AUTH, MDB_ERR_NOT_FOUND, MDB_ERR_CONFLICT, &
             MDB_ERR_QUERY, MDB_ERR_NETWORK, MDB_ERR_JSON, MDB_ERR_INVALID_ARG
   public :: MDB_DEFAULT_URL, MDB_MAX_RESPONSE_BYTES
+  public :: parse_history_retention_response
 
   !> Default daemon URL.
   character(*), parameter :: MDB_DEFAULT_URL = 'http://127.0.0.1:8453'
@@ -59,6 +60,8 @@ module mongreldb
     procedure :: drop_table => client_drop_table
     procedure :: count => client_count
     procedure :: history_retention => client_history_retention
+    procedure :: history_retention_epochs => client_history_retention_epochs
+    procedure :: earliest_retained_epoch => client_earliest_retained_epoch
     procedure :: set_history_retention_epochs => client_set_history_retention_epochs
     procedure :: put => client_put
     procedure :: upsert => client_upsert
@@ -100,6 +103,8 @@ contains
     this%url = url
     this%auth_header = 'Bearer ' // token
     this%max_bytes = MDB_MAX_RESPONSE_BYTES
+    stat = MDB_OK
+    if (present(errmsg)) errmsg = ''
   end subroutine
 
   subroutine client_connect_basic(this, url, username, password, stat, errmsg)
@@ -117,6 +122,8 @@ contains
     ! Basic auth: base64(username:password). We do a minimal base64 encode.
     this%auth_header = 'Basic ' // base64_encode(username // ':' // password)
     this%max_bytes = MDB_MAX_RESPONSE_BYTES
+    stat = MDB_OK
+    if (present(errmsg)) errmsg = ''
   end subroutine
 
   ! ---- Health -------------------------------------------------------------
@@ -162,6 +169,7 @@ contains
       return
     end if
     if (doc%kind /= JSON_ARRAY) then
+      call this%set_err(MDB_ERR_JSON, 'tables response is not a JSON array', errmsg)
       allocate(character(0) :: names(0))
       return
     end if
@@ -225,14 +233,17 @@ contains
       return
     end if
     call json_parse(resp%body, doc, jstat, msg)
-    if (jstat == 0) then
-      if (json_object_has(doc, 'table_id')) then
-        block
-          type(json_value) :: tid_val
-          tid_val = json_object_get(doc, 'table_id')
-          if (tid_val%kind == JSON_INT) tid = tid_val%int_val
-        end block
-      end if
+    if (jstat /= 0) then
+      call this%set_err(MDB_ERR_JSON, 'failed to parse create_table response: ' // trim(msg), errmsg)
+      if (present(table_id)) table_id = 0
+      return
+    end if
+    if (json_object_has(doc, 'table_id')) then
+      block
+        type(json_value) :: tid_val
+        tid_val = json_object_get(doc, 'table_id')
+        if (tid_val%kind == JSON_INT) tid = tid_val%int_val
+      end block
     end if
     if (present(table_id)) table_id = tid
   end subroutine
@@ -286,17 +297,23 @@ contains
     integer, intent(out) :: stat
     character(*), intent(out), optional :: errmsg
     type(http_response) :: resp
-    type(json_value) :: doc, item
+    type(json_value) :: doc
     character(:), allocatable :: payload
     character(256) :: msg
     integer :: jstat
     epochs = 0; earliest = 0
     resp = this%do_request('GET', 'history/retention', payload, stat, msg)
-    if (stat /= MDB_OK) return
+    if (stat /= MDB_OK) then
+      call this%set_err(stat, msg, errmsg)
+      return
+    end if
     call json_parse(resp%body, doc, jstat, msg)
-    if (jstat /= 0) then; stat = MDB_ERR_JSON; return; end if
-    item = json_object_get(doc, 'history_retention_epochs'); epochs = item%int_val
-    item = json_object_get(doc, 'earliest_retained_epoch'); earliest = item%int_val
+    if (jstat /= 0) then
+      stat = MDB_ERR_JSON
+      call this%set_err(stat, 'failed to parse history retention response: ' // trim(msg), errmsg)
+      return
+    end if
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
   end subroutine
 
   subroutine client_set_history_retention_epochs(this, value, epochs, earliest, stat, errmsg)
@@ -306,18 +323,90 @@ contains
     integer, intent(out) :: stat
     character(*), intent(out), optional :: errmsg
     type(http_response) :: resp
-    type(json_value) :: doc, item
+    type(json_value) :: doc
     character(:), allocatable :: payload
     character(256) :: msg, number
     integer :: jstat
+    epochs = 0; earliest = 0
     write(number, '(I0)') value
     payload = '{"history_retention_epochs":' // trim(number) // '}'
     resp = this%do_request('PUT', 'history/retention', payload, stat, msg)
-    if (stat /= MDB_OK) return
+    if (stat /= MDB_OK) then
+      call this%set_err(stat, msg, errmsg)
+      return
+    end if
     call json_parse(resp%body, doc, jstat, msg)
-    if (jstat /= 0) then; stat = MDB_ERR_JSON; return; end if
-    item = json_object_get(doc, 'history_retention_epochs'); epochs = item%int_val
-    item = json_object_get(doc, 'earliest_retained_epoch'); earliest = item%int_val
+    if (jstat /= 0) then
+      stat = MDB_ERR_JSON
+      call this%set_err(stat, 'failed to parse set history retention response: ' // trim(msg), errmsg)
+      return
+    end if
+    call parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+  end subroutine
+
+  !> Helper for module-level routines that need to set an optional errmsg.
+  subroutine set_optional_err(errmsg, msg)
+    character(*), intent(out), optional :: errmsg
+    character(*), intent(in) :: msg
+    if (present(errmsg)) errmsg = msg
+  end subroutine
+
+  !> Validate the frozen GET/PUT /history/retention response shape. Exposed so
+  !> the offline wire-shape test can exercise the same parsing path as the
+  !> client methods.
+  subroutine parse_history_retention_response(doc, epochs, earliest, stat, errmsg)
+    type(json_value), intent(in) :: doc
+    integer(int64), intent(out) :: epochs, earliest
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(json_value) :: v
+
+    epochs = 0; earliest = 0
+    if (doc%kind /= JSON_OBJECT) then
+      stat = MDB_ERR_JSON
+      call set_optional_err(errmsg, 'history retention response is not a JSON object')
+      return
+    end if
+    if (size(doc%keys) /= 2 .or. &
+        .not. json_object_has(doc, 'history_retention_epochs') .or. &
+        .not. json_object_has(doc, 'earliest_retained_epoch')) then
+      stat = MDB_ERR_JSON
+      call set_optional_err(errmsg, 'history retention response keys mismatch')
+      return
+    end if
+    v = json_object_get(doc, 'history_retention_epochs')
+    if (v%kind /= JSON_INT) then
+      stat = MDB_ERR_JSON
+      call set_optional_err(errmsg, 'history_retention_epochs is not an integer')
+      return
+    end if
+    epochs = v%int_val
+    v = json_object_get(doc, 'earliest_retained_epoch')
+    if (v%kind /= JSON_INT) then
+      stat = MDB_ERR_JSON
+      call set_optional_err(errmsg, 'earliest_retained_epoch is not an integer')
+      return
+    end if
+    earliest = v%int_val
+    stat = MDB_OK
+  end subroutine
+
+  subroutine client_history_retention_epochs(this, epochs, stat, errmsg)
+    class(mongreldb_client), intent(inout) :: this
+    integer(int64), intent(out) :: epochs
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    integer(int64) :: earliest
+    call this%history_retention(epochs, earliest, stat, errmsg)
+  end subroutine
+
+  subroutine client_earliest_retained_epoch(this, earliest, stat, errmsg)
+    class(mongreldb_client), intent(inout) :: this
+    integer(int64), intent(out) :: earliest
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    integer(int64) :: epochs
+    call this%history_retention(epochs, earliest, stat, errmsg)
   end subroutine
 
   ! ---- Write helpers ------------------------------------------------------
@@ -531,7 +620,8 @@ contains
     integer, intent(out) :: stat
     character(*), intent(out) :: errmsg
     type(http_response) :: resp
-    character(:), allocatable :: url, body_msg, code_msg
+    character(:), allocatable :: url, body_msg
+    character(4096) :: code_msg
     integer :: jstat
     type(json_value) :: errdoc
 

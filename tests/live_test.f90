@@ -1,6 +1,6 @@
 !> Live integration tests for the MongrelDB Fortran client.
 !>
-!> Implements the 14-operation conformance matrix against a running
+!> Implements the 16-operation conformance matrix against a running
 !> `mongreldb-server`. The suite self-skips (exit 0) when no server is
 !> reachable, so it is safe to run in any environment.
 !>
@@ -9,7 +9,7 @@
 program live_test
   use, non_intrinsic :: mongreldb
   use, non_intrinsic :: mongreldb_json
-  use iso_fortran_env, only: int64
+  use iso_fortran_env, only: int64, real64
   implicit none
 
   type(mongreldb_client) :: db
@@ -59,6 +59,8 @@ program live_test
   call run('delete', test_delete)
   call run('schema', test_schema)
   call run('sql', test_sql)
+  call run('history_retention_read', test_history_retention_read)
+  call run('history_retention_shrink', test_history_retention_shrink)
   call run('drop_table', test_drop_table)
 
   write(*, '(A,I0,A,I0,A)') 'live_test: ', passed, ' passed, ', failed, ' failed'
@@ -132,7 +134,7 @@ contains
 
   subroutine test_tables()
     character(:), allocatable :: names(:)
-    integer :: stat, i
+    integer :: stat
     character(512) :: errmsg
     names = db%tables(stat, errmsg)
     call check(stat == MDB_OK, 'tables should succeed')
@@ -281,7 +283,6 @@ contains
     character(512) :: errmsg
     ! Create a throwaway table and drop it.
     block
-      integer(int64) :: tid
       call db%create_table(tname('drop_tbl'), build_columns(), stat, errmsg)
       call check(stat == MDB_OK, 'create before drop should succeed')
     end block
@@ -319,7 +320,7 @@ contains
     character(*), intent(in) :: result_json
     integer(int64) :: rid
     type(json_value) :: doc, rows, row
-    integer :: stat, i
+    integer :: stat
     character(256) :: errmsg
     rid = 0
     call json_parse(result_json, doc, stat, errmsg)
@@ -345,5 +346,185 @@ contains
       end block
     end if
   end function
+
+  ! ---- History retention live tests ----------------------------------------
+
+  function build_retention_columns() result(cols_json)
+    character(:), allocatable :: cols_json
+    cols_json = '[' // &
+      '{"id":1,"name":"id","ty":"int64","primary_key":true,"nullable":false},' // &
+      '{"id":2,"name":"name","ty":"varchar","primary_key":false,"nullable":false},' // &
+      '{"id":3,"name":"amount","ty":"float64","primary_key":false,"nullable":true}' // &
+      ']'
+  end function
+
+  subroutine ensure_retention_table(base)
+    character(*), intent(in) :: base
+    integer :: stat
+    character(512) :: errmsg
+    call db%create_table(tname(base), build_retention_columns(), stat, errmsg)
+  end subroutine
+
+  ! Run a count(*) AS n query against `table` AS OF EPOCH `epoch`, filtering on
+  ! the given PK and amount. Returns the count (or 0 on error).
+  function as_of_count(table, pk, amount, epoch, stat, errmsg) result(cnt)
+    character(*), intent(in) :: table
+    integer(int64), intent(in) :: pk, epoch
+    real(real64), intent(in) :: amount
+    integer, intent(out) :: stat
+    character(*), intent(out) :: errmsg
+    integer(int64) :: cnt
+    character(:), allocatable :: result_json, stmt
+    character(32) :: pk_str, epoch_str
+    character(64) :: amount_str
+    type(json_value) :: rows, row, nval
+
+    cnt = 0
+    write(pk_str, '(I0)') pk
+    write(epoch_str, '(I0)') epoch
+    write(amount_str, '(F0.1)') amount
+    stmt = 'SELECT count(*) AS n FROM ' // table // ' AS OF EPOCH ' // trim(epoch_str) // &
+           ' WHERE id = ' // trim(pk_str) // ' AND amount = ' // trim(amount_str)
+    call db%sql(stmt, result_json, stat, errmsg)
+    if (stat /= MDB_OK) return
+
+    call json_parse(result_json, rows, stat, errmsg)
+    if (stat /= 0) then
+      stat = MDB_ERR_JSON
+      return
+    end if
+    if (rows%kind /= JSON_ARRAY .or. json_array_len(rows) < 1) then
+      stat = MDB_ERR_JSON
+      return
+    end if
+    row = json_array_get(rows, 1)
+    if (.not. json_object_has(row, 'n')) then
+      stat = MDB_ERR_JSON
+      return
+    end if
+    nval = json_object_get(row, 'n')
+    if (nval%kind == JSON_INT) then
+      cnt = nval%int_val
+    else if (nval%kind == JSON_STRING) then
+      read(nval%str_val, *, iostat=stat) cnt
+      if (stat /= 0) stat = MDB_ERR_JSON
+    else
+      stat = MDB_ERR_JSON
+    end if
+  end function
+
+  ! Search [lo, hi] for an epoch where `amount` is still visible.
+  subroutine find_epoch_with_value(table, pk, amount, lo, hi, found_epoch, stat, errmsg)
+    character(*), intent(in) :: table
+    integer(int64), intent(in) :: pk, lo, hi
+    real(real64), intent(in) :: amount
+    integer(int64), intent(out) :: found_epoch
+    integer, intent(out) :: stat
+    character(*), intent(inout) :: errmsg
+    integer(int64) :: e, cnt
+
+    found_epoch = -1_int64
+    do e = lo, hi
+      cnt = as_of_count(table, pk, amount, e, stat, errmsg)
+      if (stat == MDB_OK .and. cnt > 0) then
+        found_epoch = e
+        return
+      end if
+    end do
+    stat = MDB_ERR_QUERY
+    errmsg = 'no retained epoch contained the expected value'
+  end subroutine
+
+  subroutine test_history_retention_read()
+    integer(int64) :: epochs, earliest, old_epoch
+    integer :: stat
+    character(512) :: errmsg
+
+    call db%set_history_retention_epochs(10000_int64, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'set wide retention failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call ensure_retention_table('ret_read')
+    call db%put(tname('ret_read'), '[1,1,2,"A",3,1.0]', stat, errmsg)
+    call check(stat == MDB_OK, 'put initial row failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call db%upsert(tname('ret_read'), '[1,1,2,"A",3,2.0]', stat=stat, errmsg=errmsg)
+    call check(stat == MDB_OK, 'upsert row failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call db%history_retention(epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'history_retention failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call find_epoch_with_value(tname('ret_read'), 1_int64, 1.0_real64, &
+                               earliest, earliest + 500_int64, old_epoch, stat, errmsg)
+    call check(stat == MDB_OK, 'old value not retained: ' // trim(errmsg))
+    if (stat == MDB_OK) then
+      call check(old_epoch >= earliest, 'old epoch should be >= earliest retained epoch')
+    end if
+  end subroutine
+
+  subroutine test_history_retention_shrink()
+    integer(int64) :: epochs, earliest, new_earliest, old_epoch, i
+    integer :: stat
+    character(512) :: errmsg
+    character(32) :: amt_str
+    real(real64) :: amt
+
+    call db%set_history_retention_epochs(10000_int64, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'set wide retention failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call ensure_retention_table('ret_shrink')
+    call db%put(tname('ret_shrink'), '[1,1,2,"X",3,1.0]', stat, errmsg)
+    call check(stat == MDB_OK, 'put failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call db%upsert(tname('ret_shrink'), '[1,1,2,"X",3,2.0]', stat=stat, errmsg=errmsg)
+    call check(stat == MDB_OK, 'first upsert failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    ! Advance the current epoch with several distinct commits so the floor moves.
+    do i = 1, 10
+      amt = 3.0_real64 + real(i, real64)
+      write(amt_str, '(F0.1)') amt
+      call db%upsert(tname('ret_shrink'), '[1,1,2,"X",3,' // trim(amt_str) // ']', &
+                     stat=stat, errmsg=errmsg)
+      call check(stat == MDB_OK, 'advance upsert failed')
+      if (stat /= MDB_OK) return
+    end do
+
+    call db%history_retention(epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'history_retention before shrink failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call find_epoch_with_value(tname('ret_shrink'), 1_int64, 1.0_real64, &
+                               earliest, earliest + 500_int64, old_epoch, stat, errmsg)
+    call check(stat == MDB_OK, 'old epoch not found before shrink: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call db%set_history_retention_epochs(5_int64, epochs, new_earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'shrink retention failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    call check(new_earliest > old_epoch, 'earliest retained epoch should advance past old epoch')
+
+    block
+      integer(int64) :: cnt
+      cnt = as_of_count(tname('ret_shrink'), 1_int64, 1.0_real64, old_epoch, stat, errmsg)
+      call check(stat /= MDB_OK, 'query below floor should error after shrink')
+    end block
+
+    call db%set_history_retention_epochs(10000_int64, epochs, new_earliest, stat, errmsg)
+    call check(stat == MDB_OK, 're-expand retention failed: ' // trim(errmsg))
+    if (stat /= MDB_OK) return
+
+    block
+      integer(int64) :: cnt
+      cnt = as_of_count(tname('ret_shrink'), 1_int64, 1.0_real64, old_epoch, stat, errmsg)
+      call check(stat /= MDB_OK, 'old epoch should still error after re-expansion')
+    end block
+  end subroutine
 
 end program

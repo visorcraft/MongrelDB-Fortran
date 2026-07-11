@@ -24,9 +24,9 @@ Then install [fpm](https://fpm.fortran-lang.org):
 ```sh
 # From the GitHub release (or your distribution's package manager).
 FPM_VERSION="0.10.1"
-curl -fsSL -o /tmp/fpm.tar.gz \
-  "https://github.com/fortran-lang/fpm/releases/download/v${FPM_VERSION}/fpm-${FPM_VERSION}-linux-x86_64-gcc-12.tar.gz"
-mkdir -p ~/bin && tar -xzf /tmp/fpm.tar.gz -C ~/bin
+curl -fsSL -o ~/bin/fpm \
+  "https://github.com/fortran-lang/fpm/releases/download/v${FPM_VERSION}/fpm-${FPM_VERSION}-linux-x86_64"
+chmod +x ~/bin/fpm
 export PATH="$HOME/bin:$PATH"
 fpm --version
 ```
@@ -101,8 +101,13 @@ program demo
   call db%create_table('orders', '[' // &
     '{"id":1,"name":"id","ty":"int64","primary_key":true,"nullable":false},' // &
     '{"id":2,"name":"customer","ty":"varchar","primary_key":false,"nullable":false},' // &
-    '{"id":3,"name":"amount","ty":"float64","primary_key":false,"nullable":true,"default_value":"0.0"}' // &
+    '{"id":3,"name":"amount","ty":"float64","primary_key":false,"nullable":true,"default_value":0.0},' // &
+    '{"id":4,"name":"active","ty":"bool","primary_key":false,"nullable":true,"default_value":false}' // &
     ']', stat, errmsg)
+
+  ! `default_value` preserves the JSON type you provide: numbers, booleans,
+  ! explicit null, and literal strings such as "now" are all valid. Dynamic
+  ! defaults use the separate `default_expr` field ("now" or "uuid").
 
   ! 4. Insert rows. cells is a flat [colId, value, ...] JSON array.
   call db%put('orders', '[1,1,2,"Alice",3,99.5]', stat, errmsg)
@@ -140,15 +145,37 @@ You should see the row count of 2.
 | `db%connect` | Builds a client targeting one daemon. |
 | `db%health` | GET `/health`; returns `.true.` when the daemon answers. |
 | `db%create_table` | POST `/kit/create_table`. Column `id`s are the on-wire identifiers. |
-| `default_value` | Optional static JSON scalar; omit = absent. |
-| `default_expr` | Optional dynamic default: `"now"` or `"uuid"`. |
+| `default_value` | Optional static JSON scalar: string, number, boolean, explicit `null`, or a literal string such as `"now"`. |
+| `default_expr` | Optional dynamic default: only `"now"` or `"uuid"`. Not an alias for `default_value`; set one or the other. |
 | `db%put` | Single-op transaction: POST `/kit/txn` with one `put` op. |
 | `db%query` | Builds a `/kit/query` body. Conditions push down to native indexes. |
 | `projection [1,2]` | Server returns only those column ids, saving bandwidth. |
 | `limit 100` | Caps the result; check the response `truncated` field afterward. |
 | `db%count` | GET `/tables/{name}/count`. |
 
-## 6. Common pitfalls
+## 6. History retention
+
+MongrelDB keeps a configurable number of recent commit epochs. The getters
+`history_retention_epochs` and `earliest_retained_epoch` read the current
+window and floor; `set_history_retention_epochs` changes the window. You can
+query older versions with `AS OF EPOCH`:
+
+```fortran
+integer(int64) :: epochs, earliest, old_epoch
+character(:), allocatable :: result
+
+call db%set_history_retention_epochs(10000_int64, epochs, earliest, stat, errmsg)
+call db%history_retention_epochs(epochs, stat, errmsg)
+call db%earliest_retained_epoch(earliest, stat, errmsg)
+
+! old_epoch must be >= earliest.
+call db%sql('SELECT * FROM orders AS OF EPOCH 5', result, stat, errmsg)
+```
+
+Lowering retention advances the earliest retained epoch; raising it again does
+not restore history that was already pruned.
+
+## 7. Common pitfalls
 
 **Using the column name instead of the column id.** Every on-wire API uses the
 numeric `id` from `create_table`, never the `name`. Conditions take the numeric

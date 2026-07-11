@@ -43,6 +43,15 @@ jobs:
       - name: Build
         run: fpm build --profile debug
 
+      - name: Compiler warning check
+        run: |
+          mkdir -p /tmp/fortran-warning-check
+          gfortran -Wall -Wextra -Wunused-variable -O2 -c src/mongreldb_http.f90 -o /tmp/fortran-warning-check/mongreldb_http.o
+          gfortran -Wall -Wextra -Wunused-variable -O2 -c src/mongreldb_json.f90 -o /tmp/fortran-warning-check/mongreldb_json.o
+          gfortran -Wall -Wextra -Wunused-variable -O2 -c src/mongreldb.f90 -o /tmp/fortran-warning-check/mongreldb.o
+          gfortran -Wall -Wextra -Wunused-variable -O2 -o /tmp/fortran-warning-check/wire_shape_test tests/wire_shape_test.f90 /tmp/fortran-warning-check/mongreldb.o /tmp/fortran-warning-check/mongreldb_http.o /tmp/fortran-warning-check/mongreldb_json.o
+          gfortran -Wall -Wextra -Wunused-variable -O2 -o /tmp/fortran-warning-check/live_test tests/live_test.f90 /tmp/fortran-warning-check/mongreldb.o /tmp/fortran-warning-check/mongreldb_http.o /tmp/fortran-warning-check/mongreldb_json.o
+
       - name: Run offline unit tests
         run: fpm test wire_shape --profile debug
 

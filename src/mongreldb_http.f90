@@ -100,7 +100,7 @@ contains
            ' -X ' // trim(method)
 
     if (allocated(auth_header)) then
-      args = args // ' -H ''Authorization: ' // auth_header // ''''
+      args = args // ' -H ' // shell_quote('Authorization: ' // auth_header)
     end if
     args = args // ' -H ''Content-Type: application/json'''
 

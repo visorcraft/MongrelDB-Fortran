@@ -22,8 +22,9 @@
 |---|---|---|
 | Fortran client | `MongrelDB-Fortran` | build from source with fpm + gfortran |
 
-History retention: type-bound `history_retention` and
-`set_history_retention_epochs` procedures.
+History retention: type-bound `history_retention_epochs`,
+`earliest_retained_epoch`, and `set_history_retention_epochs` procedures
+(plus `history_retention` returning both values).
 
 ## Requirements
 
@@ -86,14 +87,27 @@ program demo
 end program
 ```
 
-Column JSON can include `enum_variants`, scalar `default_value`, and dynamic
-`default_expr` (`"now"` or `"uuid"`). Native table
-CHECKs use the optional `constraints_json` argument:
+Column JSON can include `enum_variants`, a static `default_value`, and a
+dynamic `default_expr` (`"now"` or `"uuid"`). A static `default_value` may be
+a string, integer, boolean, explicit JSON `null`, or a literal string such as
+`"now"`; it is emitted as-is and is not interpreted as an expression.
+`default_expr` is the only dynamic-default discriminator and must not be used
+as an alias for `default_value`. Native table CHECKs use the optional
+`constraints_json` argument:
 
 ```fortran
 call db%create_table('orders', columns_json, stat, errmsg, &
   constraints_json='{"checks":[{"id":1,"name":"amount_nonneg","expr":' // &
     '{"Ge":[{"Col":3},{"Lit":{"Float64":0.0}}]}}]}')
+```
+
+A column spec with every default shape:
+
+```fortran
+'{"id":4,"name":"active","ty":"bool","nullable":true,"default_value":true}'
+'{"id":5,"name":"notes","ty":"varchar","nullable":true,"default_value":null}'
+'{"id":6,"name":"created","ty":"varchar","nullable":true,"default_value":"now"}'
+'{"id":7,"name":"updated","ty":"varchar","nullable":true,"default_expr":"now"}'
 ```
 
 ## Build
@@ -119,7 +133,7 @@ fpm test wire_shape
 MONGRELDB_URL=http://127.0.0.1:8453 fpm test live_conformance
 ```
 
-The live suite implements the full 14-operation conformance matrix and
+The live suite implements the full 16-operation conformance matrix and
 self-skips when no server is reachable.
 
 ## API Reference
@@ -145,6 +159,10 @@ category code on failure. Most accept an optional `errmsg` for the detail.
 | `create_table(name, columns_json, stat, errmsg[, table_id, constraints_json])` | `POST /kit/create_table` | Returns table id; optional `constraints_json` forwards native table constraints. |
 | `drop_table(name, stat, errmsg)` | `DELETE /tables/{name}` | |
 | `count(table, stat, errmsg)` | `GET /tables/{name}/count` | Returns row count. |
+| `history_retention(epochs, earliest, stat, errmsg)` | `GET /history/retention` | Returns both retention values. |
+| `history_retention_epochs(epochs, stat, errmsg)` | `GET /history/retention` | Returns the configured retention window. |
+| `earliest_retained_epoch(earliest, stat, errmsg)` | `GET /history/retention` | Returns the earliest readable epoch floor. |
+| `set_history_retention_epochs(value, epochs, earliest, stat, errmsg)` | `PUT /history/retention` | Sets the window; returns post-update values. |
 | `put(table, cells_json, stat, errmsg)` | `POST /kit/txn` | Single-op put. |
 | `upsert(table, cells_json, update_json, stat, errmsg)` | `POST /kit/txn` | Insert-or-update. |
 | `delete(table, row_id, stat, errmsg)` | `POST /kit/txn` | Delete by row id. |

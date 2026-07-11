@@ -22,6 +22,9 @@
 |---|---|---|
 | Fortran client | `MongrelDB-Fortran` | build from source with fpm + gfortran |
 
+History retention: type-bound `history_retention` and
+`set_history_retention_epochs` procedures.
+
 ## Requirements
 
 - **A Fortran 2018 compiler** (gfortran 11+, ifort/flang also work)

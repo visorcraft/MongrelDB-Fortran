@@ -58,6 +58,8 @@ module mongreldb
     procedure :: create_table => client_create_table
     procedure :: drop_table => client_drop_table
     procedure :: count => client_count
+    procedure :: history_retention => client_history_retention
+    procedure :: set_history_retention_epochs => client_set_history_retention_epochs
     procedure :: put => client_put
     procedure :: upsert => client_upsert
     procedure :: delete => client_delete
@@ -277,6 +279,46 @@ contains
       if (cnt_val%kind == JSON_INT) n = cnt_val%int_val
     end block
   end function
+
+  subroutine client_history_retention(this, epochs, earliest, stat, errmsg)
+    class(mongreldb_client), intent(inout) :: this
+    integer(int64), intent(out) :: epochs, earliest
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(http_response) :: resp
+    type(json_value) :: doc, item
+    character(:), allocatable :: payload
+    character(256) :: msg
+    integer :: jstat
+    epochs = 0; earliest = 0
+    resp = this%do_request('GET', 'history/retention', payload, stat, msg)
+    if (stat /= MDB_OK) return
+    call json_parse(resp%body, doc, jstat, msg)
+    if (jstat /= 0) then; stat = MDB_ERR_JSON; return; end if
+    item = json_object_get(doc, 'history_retention_epochs'); epochs = item%int_val
+    item = json_object_get(doc, 'earliest_retained_epoch'); earliest = item%int_val
+  end subroutine
+
+  subroutine client_set_history_retention_epochs(this, value, epochs, earliest, stat, errmsg)
+    class(mongreldb_client), intent(inout) :: this
+    integer(int64), intent(in) :: value
+    integer(int64), intent(out) :: epochs, earliest
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(http_response) :: resp
+    type(json_value) :: doc, item
+    character(:), allocatable :: payload
+    character(256) :: msg, number
+    integer :: jstat
+    write(number, '(I0)') value
+    payload = '{"history_retention_epochs":' // trim(number) // '}'
+    resp = this%do_request('PUT', 'history/retention', payload, stat, msg)
+    if (stat /= MDB_OK) return
+    call json_parse(resp%body, doc, jstat, msg)
+    if (jstat /= 0) then; stat = MDB_ERR_JSON; return; end if
+    item = json_object_get(doc, 'history_retention_epochs'); epochs = item%int_val
+    item = json_object_get(doc, 'earliest_retained_epoch'); earliest = item%int_val
+  end subroutine
 
   ! ---- Write helpers ------------------------------------------------------
 

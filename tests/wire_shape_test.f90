@@ -243,6 +243,8 @@ contains
     call check(json_object_has(parsed, 'columns'), 'payload missing columns key')
     call check(index(s, '"default_value":3') > 0, 'payload missing scalar default_value')
     call check(index(s, '"default_expr":"uuid"') > 0, 'payload missing default_expr')
+    call check(index('["text",3,true,null,"now"]', 'null') > 0, &
+      'static JSON scalar matrix malformed')
     call check(index(s, '"constraints":{"checks":[') > 0, 'payload missing constraints.checks')
     call check(index(s, '"name":"positive_id"') > 0, 'payload missing CHECK name')
   end subroutine

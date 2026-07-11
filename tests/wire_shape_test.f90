@@ -221,7 +221,13 @@ contains
     character(:), allocatable :: cols_str, s
     cols = json_make_array()
     call json_array_push(cols, make_col(1_int64, 'id', 'int64', .true.))
-    call json_array_push(cols, make_col(2_int64, 'name', 'varchar', .false.))
+    block
+      type(json_value) :: col
+      col = make_col(2_int64, 'name', 'varchar', .false.)
+      call json_object_set_int(col, 'default_value', 3_int64)
+      call json_object_set_str(col, 'default_expr', 'uuid')
+      call json_array_push(cols, col)
+    end block
     cols_str = json_serialize(cols)
     obj = json_make_object()
     call json_object_set_str(obj, 'name', 'orders')
@@ -235,6 +241,8 @@ contains
     call json_parse(s, parsed, stat, errmsg)
     call check(stat == 0, 'embedded payload re-parse failed')
     call check(json_object_has(parsed, 'columns'), 'payload missing columns key')
+    call check(index(s, '"default_value":3') > 0, 'payload missing scalar default_value')
+    call check(index(s, '"default_expr":"uuid"') > 0, 'payload missing default_expr')
     call check(index(s, '"constraints":{"checks":[') > 0, 'payload missing constraints.checks')
     call check(index(s, '"name":"positive_id"') > 0, 'payload missing CHECK name')
   end subroutine

@@ -140,7 +140,8 @@ You should see the row count of 2.
 | `db%connect` | Builds a client targeting one daemon. |
 | `db%health` | GET `/health`; returns `.true.` when the daemon answers. |
 | `db%create_table` | POST `/kit/create_table`. Column `id`s are the on-wire identifiers. |
-| `default_value` | Optional column field. Default value string; omit = absent. |
+| `default_value` | Optional static JSON scalar; omit = absent. |
+| `default_expr` | Optional dynamic default: `"now"` or `"uuid"`. |
 | `db%put` | Single-op transaction: POST `/kit/txn` with one `put` op. |
 | `db%query` | Builds a `/kit/query` body. Conditions push down to native indexes. |
 | `projection [1,2]` | Server returns only those column ids, saving bandwidth. |

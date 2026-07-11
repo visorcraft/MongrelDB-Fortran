@@ -83,7 +83,8 @@ program demo
 end program
 ```
 
-Column JSON can include `enum_variants` and `default_value`. Native table
+Column JSON can include `enum_variants`, scalar `default_value`, and dynamic
+`default_expr` (`"now"` or `"uuid"`). Native table
 CHECKs use the optional `constraints_json` argument:
 
 ```fortran

@@ -41,7 +41,9 @@ program basic_crud
     '{"id":3,"name":"amount","ty":"float64","primary_key":false,"nullable":true}' // &
     ']'
 
-  call db%create_table(table, cols_json, stat, errmsg)
+  call db%create_table(table, cols_json, stat, errmsg, &
+    constraints_json='{"checks":[{"id":1,"name":"amount_nonneg","expr":' // &
+      '{"Ge":[{"Col":3},{"Lit":{"Float64":0.0}}]}}]}')
   if (stat /= MDB_OK) call die('create_table failed: ' // trim(errmsg))
 
   write(*, '(A)') 'Created table ' // table

@@ -215,7 +215,7 @@ contains
     ! Building a create_table payload from caller-supplied column JSON must
     ! produce a valid object. We verify by parsing the columns and embedding
     ! them, then checking the result is well-formed JSON.
-    type(json_value) :: cols, obj, parsed
+    type(json_value) :: cols, obj, constraints, parsed
     integer :: stat
     character(256) :: errmsg
     character(:), allocatable :: cols_str, s
@@ -227,10 +227,16 @@ contains
     call json_object_set_str(obj, 'name', 'orders')
     call json_parse_and_set(obj, 'columns', cols_str, stat, errmsg)
     call check(stat == 0, 'column embed parse failed')
+    call json_parse('{"checks":[{"id":1,"name":"positive_id","expr":' // &
+      '{"Gt":[{"Col":1},{"Lit":{"Int64":0}}]}}]}', constraints, stat, errmsg)
+    call check(stat == 0, 'constraints parse failed')
+    call json_object_set(obj, 'constraints', constraints)
     s = json_serialize(obj)
     call json_parse(s, parsed, stat, errmsg)
     call check(stat == 0, 'embedded payload re-parse failed')
     call check(json_object_has(parsed, 'columns'), 'payload missing columns key')
+    call check(index(s, '"constraints":{"checks":[') > 0, 'payload missing constraints.checks')
+    call check(index(s, '"name":"positive_id"') > 0, 'payload missing CHECK name')
   end subroutine
 
   function make_col(id, nm, ty, pk) result(col)

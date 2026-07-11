@@ -178,15 +178,16 @@ contains
 
   !> POST /kit/create_table. `columns_json` is the serialized columns array.
   !> Sets `table_id` to the new table id, or 0 if none was reported.
-  subroutine client_create_table(this, name, columns_json, stat, errmsg, table_id)
+  subroutine client_create_table(this, name, columns_json, stat, errmsg, table_id, constraints_json)
     class(mongreldb_client), intent(inout) :: this
     character(*), intent(in) :: name
     character(*), intent(in) :: columns_json
     integer, intent(out) :: stat
     character(*), intent(out), optional :: errmsg
     integer(int64), intent(out), optional :: table_id
+    character(*), intent(in), optional :: constraints_json
     type(http_response) :: resp
-    type(json_value) :: body, cols, doc
+    type(json_value) :: body, cols, constraints, doc
     character(:), allocatable :: payload
     integer :: jstat
     integer(int64) :: tid
@@ -204,6 +205,15 @@ contains
     body = json_make_object()
     call json_object_set_str(body, 'name', name)
     call json_object_set(body, 'columns', cols)
+    if (present(constraints_json)) then
+      call json_parse(constraints_json, constraints, jstat, msg)
+      if (jstat /= 0 .or. constraints%kind /= JSON_OBJECT) then
+        call this%set_err(MDB_ERR_INVALID_ARG, 'invalid constraints JSON object', errmsg)
+        if (present(table_id)) table_id = 0
+        return
+      end if
+      call json_object_set(body, 'constraints', constraints)
+    end if
     payload = json_serialize(body)
 
     resp = this%do_request('POST', 'kit/create_table', payload, stat, msg)

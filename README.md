@@ -83,6 +83,15 @@ program demo
 end program
 ```
 
+Column JSON can include `enum_variants` and `default_value`. Native table
+CHECKs use the optional `constraints_json` argument:
+
+```fortran
+call db%create_table('orders', columns_json, stat, errmsg, &
+  constraints_json='{"checks":[{"id":1,"name":"amount_nonneg","expr":' // &
+    '{"Ge":[{"Col":3},{"Lit":{"Float64":0.0}}]}}]}')
+```
+
 ## Build
 
 ```sh
@@ -129,7 +138,7 @@ category code on failure. Most accept an optional `errmsg` for the detail.
 |---|---|---|
 | `health()` | `GET /health` | Returns logical; never errors. |
 | `tables(stat, errmsg)` | `GET /tables` | Returns list of names. |
-| `create_table(name, columns_json, stat, errmsg)` | `POST /kit/create_table` | Returns table id. |
+| `create_table(name, columns_json, stat, errmsg[, table_id, constraints_json])` | `POST /kit/create_table` | Returns table id; optional `constraints_json` forwards native table constraints. |
 | `drop_table(name, stat, errmsg)` | `DELETE /tables/{name}` | |
 | `count(table, stat, errmsg)` | `GET /tables/{name}/count` | Returns row count. |
 | `put(table, cells_json, stat, errmsg)` | `POST /kit/txn` | Single-op put. |

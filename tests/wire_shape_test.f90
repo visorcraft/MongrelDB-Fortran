@@ -7,7 +7,26 @@ program wire_shape_test
   use, non_intrinsic :: mongreldb_json
   use, non_intrinsic :: mongreldb
   use iso_fortran_env, only: int64, real64
+  use iso_c_binding, only: c_char, c_int
   implicit none
+
+  ! POSIX bindings used only by the retention transport test. gfortran has
+  ! no portable Fortran intrinsic for setting an environment variable that
+  ! child processes (the mock curl spawned by mongreldb_http) inherit, so
+  ! we bind to POSIX setenv(3) directly. getpid(2) seeds a unique temp dir.
+  interface
+    function c_setenv(name, value, overwrite) bind(C, name="setenv") result(rc)
+      import :: c_char, c_int
+      character(kind=c_char), intent(in) :: name(*)
+      character(kind=c_char), intent(in) :: value(*)
+      integer(kind=c_int), value, intent(in) :: overwrite
+      integer(kind=c_int) :: rc
+    end function
+    function c_getpid() bind(C, name="getpid") result(p)
+      import :: c_int
+      integer(kind=c_int) :: p
+    end function
+  end interface
 
   integer :: passed, failed
   integer :: test_fails = 0
@@ -30,6 +49,7 @@ program wire_shape_test
   call run('history retention parse extra key', test_history_retention_parse_extra)
   call run('history retention parse non-integer', test_history_retention_parse_non_int)
   call run('set history retention payload', test_set_history_retention_payload)
+  call run('history retention transport PUT/GET', test_history_retention_transport)
   call run('static default matrix', test_static_default_matrix)
 
   write(*, '(A,I0,A,I0,A)') 'wire_shape: ', passed, ' passed, ', failed, ' failed'
@@ -458,5 +478,299 @@ contains
     character(16) :: s
     write(s, '(I0)') i
   end function
+
+  ! ---- Retention transport test -------------------------------------------
+  !
+  ! The wire-shape tests above exercise the JSON payload builders and the
+  ! response parser in isolation. This test drives the client's real
+  ! `set_history_retention_epochs` and `history_retention` methods through
+  ! the HTTP transport (`mongreldb_http` shells out to `curl`) so we can
+  ! assert the actual on-wire method, path, PUT body key, and the mapping
+  ! of a non-2xx response to a typed error code.
+  !
+  ! No daemon is required. A mock `curl` shell script is installed in a
+  ! private temp directory and prepended to PATH for the duration of the
+  ! test. The script records each invocation's method/URL/body to a file
+  ! and replays a canned status+body so the client's parsing path runs
+  ! end to end. PATH is restored and the temp directory removed on exit.
+
+  ! The mock curl script body, written verbatim to <tmpdir>/curl.
+  ! It understands the exact argument vector mongreldb_http emits:
+  !   curl --silent --show-error --noproxy '*' --max-redirs 0
+  !        --connect-timeout N --max-time N --max-filesize N
+  !        -X METHOD [-H 'Authorization: ...'] -H 'Content-Type: ...'
+  !        -o OUTFILE -w '%{http_code}' URL [--data-binary @BODYFILE]
+  ! The -w write-out (the canned HTTP status) goes to stdout (captured by
+  ! the client via shell redirection); the response body is written to the
+  ! -o target so the client's body reader sees it.
+  subroutine mock_curl_script(buf)
+    character(:), allocatable, intent(out) :: buf
+    character(len=1), parameter :: nl = achar(10)
+    buf = '#!/bin/sh' // nl // &
+      'out=""; method="GET"; url=""; body_src=""' // nl // &
+      'while [ $# -gt 0 ]; do' // nl // &
+      '  case "$1" in' // nl // &
+      '    -X) method="$2"; shift 2 ;;' // nl // &
+      '    -o) out="$2"; shift 2 ;;' // nl // &
+      '    --data-binary) body_src="${2#@}"; shift 2 ;;' // nl // &
+      '    http://*|https://*) url="$1"; shift ;;' // nl // &
+      '    *) shift ;;' // nl // &
+      '  esac' // nl // &
+      'done' // nl // &
+      '{ printf "method=%s\n" "$method"; printf "url=%s\n" "$url"; ' // &
+      'if [ -n "$body_src" ] && [ -f "$body_src" ]; then printf "body="; ' // &
+      'cat "$body_src"; printf "\n"; fi; } > "$MDB_MOCK_RECORD"' // nl // &
+      'if [ -n "$out" ]; then if [ -n "$MDB_MOCK_BODY" ] && [ -f "$MDB_MOCK_BODY" ]; ' // &
+      'then cat "$MDB_MOCK_BODY" > "$out"; else : > "$out"; fi; fi' // nl // &
+      'if [ -n "$MDB_MOCK_STATUS" ] && [ -f "$MDB_MOCK_STATUS" ]; ' // &
+      'then cat "$MDB_MOCK_STATUS"; else printf "200"; fi' // nl
+  end subroutine
+
+  ! env_set installs NAME=VALUE in the process environment so child
+  ! processes (the mock curl, spawned by mongreldb_http) inherit it.
+  subroutine env_set(name, value)
+    character(*), intent(in) :: name, value
+    integer :: rc
+    rc = c_setenv(trim(name)//char(0), trim(value)//char(0), 1)
+    if (rc /= 0) call fail('setenv failed for ' // name)
+  end subroutine
+
+  ! env_get reads NAME into buf (Fortran 2008 intrinsic; portable).
+  subroutine env_get(name, buf)
+    character(*), intent(in) :: name
+    character(:), allocatable, intent(out) :: buf
+    integer :: len
+    call get_environment_variable(name, length=len)
+    if (len <= 0) then
+      allocate(character(0) :: buf); return
+    end if
+    allocate(character(len) :: buf)
+    call get_environment_variable(name, buf)
+  end subroutine
+
+  ! shell_quote_t wraps a string in single quotes for safe shell
+  ! interpolation. A local mirror of mongreldb_http's private shell_quote.
+  function shell_quote_t(s) result(q)
+    character(*), intent(in) :: s
+    character(:), allocatable :: q
+    integer :: i
+    q = ''''
+    do i = 1, len(s)
+      if (s(i:i) == '''') then
+        q = q // ''''''
+      else
+        q = q // s(i:i)
+      end if
+    end do
+    q = q // ''''
+  end function
+
+  ! write_text_file writes content (which may contain any byte value) to
+  ! path using stream access so no line-buffer translation occurs.
+  subroutine write_text_file(path, content, stat)
+    character(*), intent(in) :: path, content
+    integer, intent(out) :: stat
+    integer :: u
+    open(newunit=u, file=path, status='replace', action='write', &
+         form='unformatted', access='stream', iostat=stat)
+    if (stat /= 0) return
+    write(u, iostat=stat) content
+    close(u)
+  end subroutine
+
+  ! read_text_file_alloc_t reads a file into a deferred-length string via
+  ! stream access (byte-accurate, no line truncation).
+  subroutine read_text_file_alloc_t(path, buf, stat)
+    character(*), intent(in) :: path
+    character(:), allocatable, intent(out) :: buf
+    integer, intent(out) :: stat
+    integer :: u, filesize, i
+    logical :: exists
+    character(1), allocatable :: chars(:)
+    stat = 0
+    allocate(character(0) :: buf)
+    inquire(file=path, exist=exists)
+    if (.not. exists) return
+    open(newunit=u, file=path, status='old', action='read', &
+         form='unformatted', access='stream', iostat=stat)
+    if (stat /= 0) return
+    filesize = 0
+    inquire(unit=u, size=filesize, iostat=stat)
+    if (stat /= 0 .or. filesize <= 0) then
+      close(u); stat = 0; return
+    end if
+    allocate(chars(filesize))
+    rewind(u)
+    read(u, iostat=stat) chars
+    close(u)
+    if (stat /= 0) then
+      stat = 0; return
+    end if
+    do i = 1, filesize
+      buf = buf // chars(i)
+    end do
+  end subroutine
+
+  ! record_field scans the mock curl's record file (lines of the form
+  ! "key=value") and returns the value for the given key.
+  subroutine record_field(path, key, value, found)
+    character(*), intent(in) :: path, key
+    character(:), allocatable, intent(out) :: value
+    logical, intent(out) :: found
+    character(:), allocatable :: buf, line, prefix
+    integer :: i, j, nl_pos
+    found = .false.
+    allocate(character(0) :: value)
+    call read_text_file_alloc_t(path, buf, i)
+    if (i /= 0 .or. len(buf) == 0) return
+    prefix = trim(key) // '='
+    i = 1
+    do while (i <= len(buf))
+      ! Find end of this line.
+      nl_pos = index(buf(i:), char(10))
+      if (nl_pos == 0) then
+        line = buf(i:)
+        i = len(buf) + 1
+      else
+        line = buf(i : i + nl_pos - 2)
+        i = i + nl_pos
+      end if
+      if (len(line) >= len(prefix)) then
+        if (line(1:len(prefix)) == prefix) then
+          value = line(len(prefix)+1:)
+          found = .true.
+          return
+        end if
+      end if
+    end do
+  end subroutine
+
+  ! make_test_dir creates a unique temp directory for this test run and
+  ! returns its path. Uses getpid via C interop so concurrent test
+  ! processes do not collide.
+  function make_test_dir() result(dir)
+    character(:), allocatable :: dir
+    character(len=4096) :: tmpbuf
+    integer :: dirlen, pid, stat
+    integer, save :: counter = 0
+    counter = counter + 1
+    call get_environment_variable('TMPDIR', tmpbuf, length=dirlen)
+    if (dirlen <= 0) then
+      dir = '/tmp/mdb_wire_' // int_str_pseudo()
+    else
+      dir = tmpbuf(1:dirlen) // '/mdb_wire_' // int_str_pseudo()
+    end if
+    pid = c_getpid()
+    dir = dir // '_' // trim(int_to_str(pid)) // '_' // trim(int_to_str(counter))
+    call execute_command_line('mkdir -p ' // shell_quote_t(dir), exitstat=stat)
+    if (stat /= 0) call fail('failed to create test dir ' // dir)
+  end function
+
+  function int_str_pseudo() result(s)
+    character(8) :: s
+    integer :: ticks
+    call system_clock(ticks)
+    write(s, '(I0)') iand(ticks, 9999999)
+  end function
+
+  function int_to_str(i) result(s)
+    integer, intent(in) :: i
+    character(16) :: s
+    write(s, '(I0)') i
+  end function
+
+  subroutine test_history_retention_transport()
+    type(mongreldb_client) :: db
+    integer :: stat, chmod_stat
+    integer(int64) :: epochs, earliest
+    character(256) :: errmsg
+    character(:), allocatable :: tmpdir, rec_path, body_path, status_path, &
+                                 curl_path, script_body, saved_path
+    character(:), allocatable :: r_method, r_url, r_body
+    logical :: found
+
+    ! Create a private temp directory and install the mock curl there.
+    tmpdir = make_test_dir()
+    curl_path = tmpdir // '/curl'
+    rec_path = tmpdir // '/record'
+    body_path = tmpdir // '/body'
+    status_path = tmpdir // '/status'
+    call mock_curl_script(script_body)
+    call write_text_file(curl_path, script_body, stat)
+    call check(stat == 0, 'failed to write mock curl script')
+    if (stat /= 0) return
+
+    call execute_command_line('chmod +x ' // shell_quote_t(curl_path), &
+                              exitstat=chmod_stat)
+    call check(chmod_stat == 0, 'failed to chmod mock curl script')
+    if (chmod_stat /= 0) return
+
+    ! Save PATH so we can restore it (the mock curl must be found first).
+    call env_get('PATH', saved_path)
+    if (len(saved_path) == 0) saved_path = '/usr/local/bin:/usr/bin:/bin'
+
+    ! Configure the mock via env vars inherited by execute_command_line.
+    call env_set('MDB_MOCK_RECORD', rec_path)
+    call env_set('MDB_MOCK_BODY', body_path)
+    call env_set('MDB_MOCK_STATUS', status_path)
+    call env_set('PATH', tmpdir // ':' // saved_path)
+
+    ! Canned 200 response with both required keys present.
+    call write_text_file(status_path, '200', stat)
+    call write_text_file(body_path, &
+      '{"history_retention_epochs":250,"earliest_retained_epoch":5}', stat)
+
+    call db%connect('http://127.0.0.1:8453', stat, errmsg)
+    call check(stat == MDB_OK, 'connect should succeed')
+
+    ! PUT /history/retention via the real client method.
+    call db%set_history_retention_epochs(250_int64, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'set_history_retention_epochs should succeed via mock')
+    call check(epochs == 250_int64, 'set retention should echo epochs=250')
+    call check(earliest == 5_int64, 'set retention should echo earliest=5')
+
+    call record_field(rec_path, 'method', r_method, found)
+    call check(found, 'PUT record should have method field')
+    call check(found .and. r_method == 'PUT', 'PUT method mismatch: ' // r_method)
+    call record_field(rec_path, 'url', r_url, found)
+    call check(found, 'PUT record should have url field')
+    call check(found .and. index(r_url, '/history/retention') > 0, &
+               'PUT path mismatch: ' // r_url)
+    call record_field(rec_path, 'body', r_body, found)
+    call check(found, 'PUT record should have body field')
+    call check(found .and. index(r_body, '"history_retention_epochs":250') > 0, &
+               'PUT body key mismatch: ' // r_body)
+
+    ! GET /history/retention via the real client method.
+    call db%history_retention(epochs, earliest, stat, errmsg)
+    call check(stat == MDB_OK, 'history_retention should succeed via mock')
+    call check(epochs == 250_int64, 'GET retention epochs mismatch')
+    call check(earliest == 5_int64, 'GET retention earliest mismatch')
+
+    call record_field(rec_path, 'method', r_method, found)
+    call check(found .and. r_method == 'GET', 'GET method mismatch: ' // r_method)
+    call record_field(rec_path, 'url', r_url, found)
+    call check(found .and. index(r_url, '/history/retention') > 0, &
+               'GET path mismatch: ' // r_url)
+
+    ! Error propagation: a non-2xx response must surface as a typed error.
+    ! 500 maps to MDB_ERR_QUERY (the generic non-2xx bucket in status_to_code).
+    call write_text_file(status_path, '500', stat)
+    call db%history_retention(epochs, earliest, stat, errmsg)
+    call check(stat == MDB_ERR_QUERY, &
+               '500 should propagate as MDB_ERR_QUERY (got ' // trim(int_to_str(stat)) // ')')
+
+    ! 404 maps to MDB_ERR_NOT_FOUND (proves the status is actually read).
+    call write_text_file(status_path, '404', stat)
+    call db%set_history_retention_epochs(1_int64, epochs, earliest, stat, errmsg)
+    call check(stat == MDB_ERR_NOT_FOUND, &
+               '404 should propagate as MDB_ERR_NOT_FOUND (got ' // trim(int_to_str(stat)) // ')')
+
+    ! Cleanup: restore PATH so subsequent tests use the real curl, and
+    ! remove the temp directory. This runs unconditionally (check() does
+    ! not abort) so PATH never leaks across tests.
+    call env_set('PATH', saved_path)
+    call execute_command_line('rm -rf ' // shell_quote_t(tmpdir), exitstat=stat)
+  end subroutine
 
 end program

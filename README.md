@@ -156,7 +156,7 @@ category code on failure. Most accept an optional `errmsg` for the detail.
 |---|---|---|
 | `health()` | `GET /health` | Returns logical; never errors. |
 | `tables(stat, errmsg)` | `GET /tables` | Returns list of names. |
-| `create_table(name, columns_json, stat, errmsg[, table_id, constraints_json])` | `POST /kit/create_table` | Returns table id; optional `constraints_json` forwards native table constraints. |
+| `create_table(name, columns_json, stat, errmsg[, table_id, constraints_json, indexes_json])` | `POST /kit/create_table` | Creates a table with optional constraints and all index definitions. |
 | `drop_table(name, stat, errmsg)` | `DELETE /tables/{name}` | |
 | `count(table, stat, errmsg)` | `GET /tables/{name}/count` | Returns row count. |
 | `history_retention(epochs, earliest, stat, errmsg)` | `GET /history/retention` | Returns both retention values. |

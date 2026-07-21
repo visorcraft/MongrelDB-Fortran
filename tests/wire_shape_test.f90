@@ -51,6 +51,7 @@ program wire_shape_test
   call run('set history retention payload', test_set_history_retention_payload)
   call run('history retention transport PUT/GET', test_history_retention_transport)
   call run('static default matrix', test_static_default_matrix)
+  call run('ANN backend option wire shape', test_ann_backend_options)
 
   write(*, '(A,I0,A,I0,A)') 'wire_shape: ', passed, ' passed, ', failed, ' failed'
   if (failed > 0) error stop 1
@@ -182,6 +183,22 @@ contains
       inner_val = json_object_get(got, 'nested_key')
       call check(inner_val%str_val == 'nested_value', 'nested value mismatch')
     end block
+  end subroutine
+
+  subroutine test_ann_backend_options()
+    type(json_value) :: value
+    character(:), allocatable :: wire
+    integer :: stat
+    character(256) :: errmsg
+    call json_parse('{"indexes":[{"name":"ann","column_id":2,"kind":"ann",' // &
+      '"options":{"ann":{"algorithm":"diskann","quantization":"dense",' // &
+      '"diskann":{"r":64,"l":128,"beam_width":8,"alpha":120}}}}]}', &
+      value, stat, errmsg)
+    call check(stat == 0, 'ANN option JSON parse failed')
+    wire = json_serialize(value)
+    call check(index(wire, '"algorithm":"diskann"') > 0, 'ANN algorithm missing')
+    call check(index(wire, '"quantization":"dense"') > 0, 'ANN quantization missing')
+    call check(index(wire, '"beam_width":8') > 0, 'DiskANN options missing')
   end subroutine
 
   subroutine test_url_encode()

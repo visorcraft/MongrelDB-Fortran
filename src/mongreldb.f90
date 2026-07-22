@@ -22,10 +22,12 @@ module mongreldb
   private
 
   public :: mongreldb_client
+  public :: mdb_commit_hlc
   public :: MDB_OK, MDB_ERR_AUTH, MDB_ERR_NOT_FOUND, MDB_ERR_CONFLICT, &
             MDB_ERR_QUERY, MDB_ERR_NETWORK, MDB_ERR_JSON, MDB_ERR_INVALID_ARG
   public :: MDB_DEFAULT_URL, MDB_MAX_RESPONSE_BYTES
   public :: parse_history_retention_response
+  public :: parse_commit_hlc, query_status_commit_hlc, query_status_serialization_state
 
   !> Default daemon URL.
   character(*), parameter :: MDB_DEFAULT_URL = 'http://127.0.0.1:8453'
@@ -42,6 +44,15 @@ module mongreldb
   integer, parameter :: MDB_ERR_NETWORK   = -5
   integer, parameter :: MDB_ERR_JSON      = -6
   integer, parameter :: MDB_ERR_INVALID_ARG = -8
+
+  !> Structural HLC from durable recovery (0.64+). Not reconstructed from
+  !> free-form status text — only from nested last_commit_hlc JSON.
+  type :: mdb_commit_hlc
+    integer(int64) :: physical_micros = 0_int64
+    integer :: logical = 0
+    integer :: node_tiebreaker = 0
+    logical :: present = .false.
+  end type mdb_commit_hlc
 
   !> The client handle. Holds the base URL and an optional Authorization
   !> header value. A client is not thread-safe (Fortran has no user threads
@@ -584,10 +595,10 @@ contains
     end if
     body = json_make_object()
     call json_object_set_str(body, 'table', table)
-    call json_object_set_int(body, 'embedding_column', embedding_column)
+    call json_object_set_int(body, 'embedding_column', int(embedding_column, int64))
     call json_object_set_str(body, 'text', text)
     if (present(k)) then
-      if (k > 0) call json_object_set_int(body, 'k', k)
+      if (k > 0) call json_object_set_int(body, 'k', int(k, int64))
     end if
     payload = json_serialize(body)
     resp = this%do_request('POST', 'kit/retrieve_text', payload, stat, msg)
@@ -624,6 +635,142 @@ contains
     end if
     result_json = resp%body
     if (.not. allocated(result_json)) result_json = '{}'
+  end subroutine
+
+  !> Parse a last_commit_hlc object. hlc%present is .false. when missing.
+  subroutine parse_commit_hlc(hlc_obj, hlc)
+    type(json_value), intent(in) :: hlc_obj
+    type(mdb_commit_hlc), intent(out) :: hlc
+    type(json_value) :: v
+    hlc%present = .false.
+    hlc%physical_micros = 0_int64
+    hlc%logical = 0
+    hlc%node_tiebreaker = 0
+    if (hlc_obj%kind /= JSON_OBJECT) return
+    if (.not. json_object_has(hlc_obj, 'physical_micros')) return
+    v = json_object_get(hlc_obj, 'physical_micros')
+    if (v%kind == JSON_INT) then
+      hlc%physical_micros = v%int_val
+    else if (v%kind == JSON_REAL) then
+      hlc%physical_micros = int(v%real_val, int64)
+    else
+      return
+    end if
+    hlc%present = .true.
+    if (json_object_has(hlc_obj, 'logical')) then
+      v = json_object_get(hlc_obj, 'logical')
+      if (v%kind == JSON_INT) hlc%logical = int(v%int_val)
+    end if
+    if (json_object_has(hlc_obj, 'node_tiebreaker')) then
+      v = json_object_get(hlc_obj, 'node_tiebreaker')
+      if (v%kind == JSON_INT) hlc%node_tiebreaker = int(v%int_val)
+    end if
+  end subroutine
+
+  !> Prefer nested durable → outcome → top-level last_commit_hlc.
+  subroutine query_status_commit_hlc(status_json, hlc, stat, errmsg)
+    character(*), intent(in) :: status_json
+    type(mdb_commit_hlc), intent(out) :: hlc
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(json_value) :: root, nest, hlc_obj
+    character(256) :: msg
+    hlc%present = .false.
+    call json_parse(status_json, root, stat, msg)
+    if (stat /= 0) then
+      if (present(errmsg)) errmsg = msg
+      stat = MDB_ERR_JSON
+      return
+    end if
+    ! durable.last_commit_hlc
+    if (json_object_has(root, 'durable')) then
+      nest = json_object_get(root, 'durable')
+      if (json_object_has(nest, 'last_commit_hlc')) then
+        hlc_obj = json_object_get(nest, 'last_commit_hlc')
+        call parse_commit_hlc(hlc_obj, hlc)
+        if (hlc%present) then
+          stat = MDB_OK
+          if (present(errmsg)) errmsg = ''
+          return
+        end if
+      end if
+    end if
+    ! outcome.last_commit_hlc
+    if (json_object_has(root, 'outcome')) then
+      nest = json_object_get(root, 'outcome')
+      if (json_object_has(nest, 'last_commit_hlc')) then
+        hlc_obj = json_object_get(nest, 'last_commit_hlc')
+        call parse_commit_hlc(hlc_obj, hlc)
+        if (hlc%present) then
+          stat = MDB_OK
+          if (present(errmsg)) errmsg = ''
+          return
+        end if
+      end if
+    end if
+    ! top-level
+    if (json_object_has(root, 'last_commit_hlc')) then
+      hlc_obj = json_object_get(root, 'last_commit_hlc')
+      call parse_commit_hlc(hlc_obj, hlc)
+    end if
+    stat = MDB_OK
+    if (present(errmsg)) errmsg = ''
+  end subroutine
+
+  !> Prefer nested serialization_state, then serialization (outcome/durable).
+  subroutine query_status_serialization_state(status_json, state_out, stat, errmsg)
+    character(*), intent(in) :: status_json
+    character(:), allocatable, intent(out) :: state_out
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(json_value) :: root, nest, v
+    character(256) :: msg
+    state_out = ''
+    call json_parse(status_json, root, stat, msg)
+    if (stat /= 0) then
+      if (present(errmsg)) errmsg = msg
+      stat = MDB_ERR_JSON
+      return
+    end if
+    if (json_object_has(root, 'durable')) then
+      nest = json_object_get(root, 'durable')
+      if (json_object_has(nest, 'serialization_state')) then
+        v = json_object_get(nest, 'serialization_state')
+        if (v%kind == JSON_STRING) then
+          state_out = v%str_val
+          stat = MDB_OK
+          if (present(errmsg)) errmsg = ''
+          return
+        end if
+      end if
+      if (json_object_has(nest, 'serialization')) then
+        v = json_object_get(nest, 'serialization')
+        if (v%kind == JSON_STRING) then
+          state_out = v%str_val
+          stat = MDB_OK
+          if (present(errmsg)) errmsg = ''
+          return
+        end if
+      end if
+    end if
+    if (json_object_has(root, 'outcome')) then
+      nest = json_object_get(root, 'outcome')
+      if (json_object_has(nest, 'serialization_state')) then
+        v = json_object_get(nest, 'serialization_state')
+        if (v%kind == JSON_STRING) then
+          state_out = v%str_val
+          stat = MDB_OK
+          if (present(errmsg)) errmsg = ''
+          return
+        end if
+      end if
+      if (json_object_has(nest, 'serialization')) then
+        v = json_object_get(nest, 'serialization')
+        if (v%kind == JSON_STRING) state_out = v%str_val
+      end if
+    end if
+    stat = MDB_OK
+    if (present(errmsg)) errmsg = ''
   end subroutine
 
   subroutine client_cancel_query(this, query_id, result_json, stat, errmsg)

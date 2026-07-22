@@ -20,6 +20,11 @@ source-dir = "tests"
 main = "wire_shape_test.f90"
 
 [[test]]
+name = "durable_hlc"
+source-dir = "tests"
+main = "durable_hlc_test.f90"
+
+[[test]]
 name = "live_conformance"
 source-dir = "tests"
 main = "live_test.f90"

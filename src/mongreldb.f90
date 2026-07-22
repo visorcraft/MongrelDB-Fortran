@@ -70,6 +70,9 @@ module mongreldb
     procedure :: transaction => client_transaction
     procedure :: query => client_query
     procedure :: sql => client_sql
+    procedure :: retrieve_text => client_retrieve_text
+    procedure :: query_status => client_query_status
+    procedure :: cancel_query => client_cancel_query
     procedure :: schema => client_schema
     procedure :: schema_for => client_schema_for
     procedure, private :: do_request => client_do_request
@@ -543,6 +546,106 @@ contains
     end if
     payload = query_json
     resp = this%do_request('POST', 'kit/query', payload, stat, msg)
+    if (stat /= MDB_OK) then
+      call this%set_err(stat, msg, errmsg)
+      result_json = '{}'
+      return
+    end if
+    result_json = resp%body
+    if (.not. allocated(result_json)) result_json = '{}'
+  end subroutine
+
+  ! ---- SQL control / retrieve_text (0.64+) --------------------------------
+
+  subroutine client_retrieve_text(this, table, embedding_column, text, result_json, &
+                                  stat, errmsg, k)
+    class(mongreldb_client), intent(inout) :: this
+    character(*), intent(in) :: table, text
+    integer, intent(in) :: embedding_column
+    character(:), allocatable, intent(out) :: result_json
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    integer, intent(in), optional :: k
+    type(http_response) :: resp
+    type(json_value) :: body
+    character(:), allocatable :: payload
+    character(256) :: msg
+    if (len_trim(table) == 0) then
+      call this%set_err(MDB_ERR_QUERY, 'table is required', errmsg)
+      result_json = '{}'
+      stat = MDB_ERR_QUERY
+      return
+    end if
+    if (len_trim(text) == 0) then
+      call this%set_err(MDB_ERR_QUERY, 'text is required', errmsg)
+      result_json = '{}'
+      stat = MDB_ERR_QUERY
+      return
+    end if
+    body = json_make_object()
+    call json_object_set_str(body, 'table', table)
+    call json_object_set_int(body, 'embedding_column', embedding_column)
+    call json_object_set_str(body, 'text', text)
+    if (present(k)) then
+      if (k > 0) call json_object_set_int(body, 'k', k)
+    end if
+    payload = json_serialize(body)
+    resp = this%do_request('POST', 'kit/retrieve_text', payload, stat, msg)
+    if (stat /= MDB_OK) then
+      call this%set_err(stat, msg, errmsg)
+      result_json = '{}'
+      return
+    end if
+    result_json = resp%body
+    if (.not. allocated(result_json)) result_json = '{}'
+  end subroutine
+
+  subroutine client_query_status(this, query_id, result_json, stat, errmsg)
+    class(mongreldb_client), intent(inout) :: this
+    character(*), intent(in) :: query_id
+    character(:), allocatable, intent(out) :: result_json
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(http_response) :: resp
+    character(:), allocatable :: payload
+    character(256) :: msg
+    if (len_trim(query_id) == 0) then
+      call this%set_err(MDB_ERR_QUERY, 'query_id is required', errmsg)
+      result_json = '{}'
+      stat = MDB_ERR_QUERY
+      return
+    end if
+    resp = this%do_request('GET', 'queries/' // encode_segment(query_id), &
+                           payload, stat, msg)
+    if (stat /= MDB_OK) then
+      call this%set_err(stat, msg, errmsg)
+      result_json = '{}'
+      return
+    end if
+    result_json = resp%body
+    if (.not. allocated(result_json)) result_json = '{}'
+  end subroutine
+
+  subroutine client_cancel_query(this, query_id, result_json, stat, errmsg)
+    class(mongreldb_client), intent(inout) :: this
+    character(*), intent(in) :: query_id
+    character(:), allocatable, intent(out) :: result_json
+    integer, intent(out) :: stat
+    character(*), intent(out), optional :: errmsg
+    type(http_response) :: resp
+    type(json_value) :: body
+    character(:), allocatable :: payload
+    character(256) :: msg
+    if (len_trim(query_id) == 0) then
+      call this%set_err(MDB_ERR_QUERY, 'query_id is required', errmsg)
+      result_json = '{}'
+      stat = MDB_ERR_QUERY
+      return
+    end if
+    body = json_make_object()
+    payload = json_serialize(body)
+    resp = this%do_request('POST', 'queries/' // encode_segment(query_id) // '/cancel', &
+                           payload, stat, msg)
     if (stat /= MDB_OK) then
       call this%set_err(stat, msg, errmsg)
       result_json = '{}'
